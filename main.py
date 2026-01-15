@@ -1,85 +1,113 @@
 """
-船舶接管完整判断体系 - 主调度入口
-整合【认知耗时+操作耗时+碰撞剩余时间+接管判定+措施】全逻辑
-无任何报错，直接运行出结果
+main.py - 船舶接管辨识系统主程序 (分级协同版)
+逻辑：
+1. CRI < 0.3: 自主导航 (Autonomous) -> 不计算接管
+2. 0.3 < CRI <= 0.6: 岸基接管 (Shore) -> 用岸基参数算
+3. CRI > 0.6: 船端接管 (Onboard) -> 用船端参数算 (快)
+4. Any Time: T_rem < T_req -> 紧急避险 (MRM)
 """
-# 第一步：解决路径问题，彻底杜绝导入报错
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import time
+from config import *
+from physical_supply import CRITrendPredictor
+from human_ship_demand import calc_total_budget
 
-# 第二步：导入所有核心函数
-from core import calculate_total_takeover_time
-from utils import print_formatted_result, save_result_to_json, plot_takeover_time_breakdown
-
-# ===================== 核心新增：碰撞剩余时间+接管判定+措施逻辑（你要的核心） =====================
-def calculate_collision_remaining_time(cri_level, collision_risk):
-    """基于CRI等级+风险值，计算物理碰撞剩余时间（真实防撞倒计时）"""
-    # CRI等级对应基础碰撞时间（S=安全>L=高风险，时间递减）
-    CRI_TIME_MAP = {"S":120, "SM":90, "M":60, "ML":30, "L":20}
-    # 风险值修正系数：风险越高，剩余时间越短
-    RISK_COEFF = 0.8 if collision_risk<0.3 else 0.5 if collision_risk<0.6 else 0.2
-    base_time = CRI_TIME_MAP.get(cri_level, 120)
-    return round(max(1, base_time * RISK_COEFF), 2)
-
-def takeover_decision(total_takeover_time, collision_remain_time, take_over_range=[0,5]):
-    """
-    核心判定逻辑：接管时间 vs 碰撞剩余时间 + 预留接管区间
-    :param total_takeover_time: 模型计算的接管总耗时
-    :param collision_remain_time: 物理碰撞剩余时间
-    :param take_over_range: 接管有效区间[下限,上限]
-    :return: 接管结果+对应措施
-    """
-    remain_diff = collision_remain_time - total_takeover_time
-    lower, upper = take_over_range
+def run_hierarchical_simulation():
+    print(">>> 启动分级协同接管系统 (Hierarchical Control) <<<\n")
     
-    if remain_diff >= upper:
-        res = "✅ 接管成功(时间充裕)"
-        measure = "船舶自主接管，按预设避碰策略微调航线，岸基仅监控"
-    elif lower <= remain_diff < upper:
-        res = "⚠️ 接管成功(临界区间)"
-        measure = "立即手动接管+岸基指令辅助，全速转向/降速避碰，无容错空间"
-    elif 0 <= remain_diff < lower:
-        res = "❌ 接管超时(勉强避险)"
-        measure = "触发紧急制动+最大舵角转向，广播避险信息，碰撞风险极高"
-    else:
-        res = "❌ 接管失效(碰撞发生)"
-        measure = "启动应急防撞预案，记录碰撞数据，后续复盘优化接管模型"
-    return res, measure, remain_diff
-
-# ===================== 主运行逻辑 =====================
-def main():
-    # 1. 基础输入参数（可根据实际场景修改）
-    INPUT_PARAMS = {
-        "nasa_tlx_score":40, "is_experienced":True, "is_night":False,
-        "ship_length":20, "delta_rudder":30, "delta_speed":3,
-        "hrv_features":{"RMSSD":28, "LF":1.3, "HF":3.0, "LF_HF":0.42}
+    # 1. 初始化
+    predictor = CRITrendPredictor()
+    
+    # 2. 设定场景 (固定变量)
+    # 假设：资深船长，但在夜间值班，海况较差需要大舵角
+    SCENE = {
+        "nasa_tlx": 65,       # 中高负荷
+        "hrv_stress": 0.6,    # 生理压力中等
+        "is_exp": True,       # 资深
+        "is_night": True,     # 夜间
+        "speed": 12.0,        # 12节
+        "delta_rudder": 20.0  # 需打20度舵
     }
-    # 2. 碰撞风险参数（CRI等级+风险值，核心新增）
-    CRI_LEVEL = "M"       # S/SM/M/ML/L
-    COLLISION_RISK = 0.4  # 0-1，越高越危险
+    
+    # 3. 模拟 CRI 逐渐升高的过程 (模拟真实逼近过程)
+    # 数据流设计：从安全 -> 岸基区 -> 船端区 -> 极度危险
+    cri_stream = [0.15, 0.25, 0.32, 0.45, 0.55, 0.62, 0.75, 0.88, 0.93]
+    
+    for step, current_cri in enumerate(cri_stream):
+        print(f"--- [T={step}s] 当前 CRI: {current_cri} ---")
+        
+        # ==========================================
+        # 步骤 A: 物理供给计算 (TTCR) - 全局统一
+        # ==========================================
+        t_rem = predictor.update_and_predict(current_cri)
+        
+        # ==========================================
+        # 步骤 B: 确定控制权与模式 (你的核心需求)
+        # ==========================================
+        active_mode = None
+        control_status = ""
+        
+        if current_cri <= THRESHOLD_LOW:
+            # [0 - 0.3] 自主导航区
+            control_status = "🤖 船舶自主规划 (Autonomous)"
+            active_mode = "AUTO"
+            
+        elif current_cri <= THRESHOLD_HIGH:
+            # [0.3 - 0.6] 岸基控制区
+            control_status = "📡 岸基遥控介入 (Shore Control)"
+            active_mode = MODE_SHORE
+            
+        else:
+            # [> 0.6] 船端控制区
+            control_status = "🚢 船端人工接管 (Onboard Control)"
+            active_mode = MODE_ONBOARD
 
-    # 3. 计算核心值
-    takeover_time_dict = calculate_total_takeover_time(**INPUT_PARAMS)
-    total_takeover = takeover_time_dict["总接管时间（秒）"]
-    collision_remain = calculate_collision_remaining_time(CRI_LEVEL, COLLISION_RISK)
-    take_result, take_measure, time_diff = takeover_decision(total_takeover, collision_remain)
+        print(f"  📝 当前策略: {control_status}")
+        
+        # ==========================================
+        # 步骤 C: 分级博弈判定
+        # ==========================================
+        
+        # 情况 1: 自主导航阶段 (不计算接管，只看物理时间)
+        if active_mode == "AUTO":
+            if t_rem > 900:
+                print(f"  🟢 状态: 安全巡航")
+            else:
+                print(f"  🟢 状态: 自主避碰规划中 (T_rem: {t_rem:.1f}s)")
+        
+        # 情况 2: 需要介入 (岸基 或 船端)
+        else:
+            # 1. 计算需求时间 (使用对应模式的参数!)
+            t_budget, t_hum, t_shp, t_comm = calc_total_budget(
+                active_mode, 
+                SCENE["nasa_tlx"], SCENE["hrv_stress"], 
+                SCENE["is_exp"], SCENE["is_night"], 
+                SCENE["speed"], SCENE["delta_rudder"]
+            )
+            
+            # 2. 计算动态余量
+            delta_t = SAFETY_MARGIN_BASE + (SCENE["speed"] * 0.5)
+            
+            # 3. 判定阈值
+            threshold = t_budget + delta_t
+            margin = t_rem - threshold
+            
+            print(f"  ⏳ 物理剩余: {t_rem:.1f}s | 📊 需求预算: {t_budget:.1f}s (人{t_hum}+船{t_shp})")
+            
+            # 4. 核心判决逻辑
+            if margin > 0:
+                # 时间够用 -> 发出接管请求
+                if active_mode == MODE_SHORE:
+                    print(f"  🟡 [岸基指令] 请岸基驾驶员介入调整航线 (裕度+{margin:.1f}s)")
+                    print("     -> 此时岸基人员有足够时间完成态势感知恢复")
+                else:
+                    print(f"  🟠 [船端指令] 请船长立即掌舵 (裕度+{margin:.1f}s)")
+                    print("     -> 岸基已来不及，切换至船端，利用其快反应优势成功匹配")
+            else:
+                # 时间不够用 -> 熔断 -> MRM
+                print(f"  🔴 [紧急熔断] 🚫 接管来不及 (缺口{margin:.1f}s) -> 触发 MRM 自动避险")
 
-    # 4. 完整结果输出
-    print("="*70)
-    print("📊 船舶接管完整判断体系结果")
-    print("="*70)
-    print(f"📌 物理碰撞剩余时间：{collision_remain} 秒")
-    print(f"📌 模型计算接管时间：{total_takeover} 秒")
-    print(f"📌 时间差(碰撞-接管)：{time_diff} 秒")
-    print(f"📌 接管有效区间：[0,5] 秒")
-    print("-"*70)
-    print(f"🔍 最终接管判定：{take_result}")
-    print(f"⚙️  对应执行措施：{take_measure}")
-    print("-"*70)
-    print_formatted_result(takeover_time_dict)
-    save_result_to_json(takeover_time_dict)
-    plot_takeover_time_breakdown(takeover_time_dict)
+        print("-" * 60)
+        time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    run_hierarchical_simulation()
